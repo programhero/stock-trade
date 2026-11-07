@@ -1,0 +1,8 @@
+# 核心回测/风控/撮合/报告仅依赖 Python 标准库（Python >= 3.11，无需安装）。
+#
+# 以下依赖仅在需要真实 A 股行情时安装：
+#   python -m pip install -r requirements.txt
+#
+# fetch / backtest --source akshare / paper 命令使用：
+akshare>=1.16
+pandas>=2.0

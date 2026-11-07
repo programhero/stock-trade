@@ -1,0 +1,70 @@
+# qtrade 专用配置：002352 顺丰控股（1 分钟日内做 T）
+#
+# 该配置由 scripts/tune_002352.py 在
+#   data/002352_1min.csv（2026-11-02 ~ 2026-11-06，1200 根 1 分钟 K 线）
+# 上做多轮参数搜索后得到。评价口径为“剔除底仓市值波动后的做 T 交易净盈亏”，
+# 而非账户总盈亏（本区间底仓随股价上涨贡献了约 +17,400 元，容易掩盖策略本身表现）。
+#
+# 回测结果（1bp 单边滑点、默认费率）：
+#   做 T 交易净盈亏 +1,955.40 元 | 24 次配对 | 配对胜率 83.3% | 最大交易回撤 400 元
+#   五个交易日每天的交易净盈亏均为正（+717 / +162 / +491 / +195 / +390）
+#   2bp 滑点压力测试下仍为 +1,559 元、5/5 天盈利
+#
+# 注意：仅 5 个交易日样本，参数存在过拟合风险；实盘前请用更长区间和纸面交易验证。
+# 运行：python main.py backtest --config config_002352.toml
+
+[symbol]
+code = "002352"
+name = "顺丰控股"
+exchange = "SZ"
+
+[data]
+source = "csv"
+csv_path = "data/002352_1min.csv"
+synthetic_days = 5
+synthetic_seed = 20261106
+synthetic_start_price = 100.0
+lookback_days = 5
+poll_seconds = 15
+
+[broker]
+initial_cash = 1000000.0
+# 底仓 10,000 股（约 34 万元市值），必须与 strategy.base_position 一致
+initial_position = 10000
+# 0 = 用首根 K 线开盘价作为底仓成本，避免演示成本价 100 元造成已实现盈亏失真
+initial_avg_cost = 0.0
+slippage_bps = 1.0
+
+[broker.fees]
+commission_rate = 0.00025   # 佣金万 2.5
+min_commission = 5.0        # 单笔最低佣金
+stamp_duty_rate = 0.0005    # 印花税 0.05%，仅卖出
+transfer_fee_rate = 0.00001 # 过户费 0.001%，双向
+
+[risk]
+max_order_notional = 1000000.0
+max_daily_trades = 60           # 实测单日最多 14 笔，60 足够且保留约束
+# 注意：日内亏损按“包含底仓市值”的账户权益计算，隔夜跳空也会计入。
+# 该股 1 万元底仓对应约 34 万元市值，1% 的跳空就有 3,400 元，
+# 因此阈值不能沿用默认 3,000 元，否则正常跳空就会熔断并阻断尾盘回补。
+# 20,000 元（约账户权益 1.5%）只用于拦截极端行情。
+max_daily_loss = 20000.0
+max_position_deviation = 2000   # 必须 >= max_offset_lots * lot_size = 20 * 100
+min_order_interval_bars = 1
+price_limit_pct = 0.10
+
+[strategy]
+name = "vwap_scalper"
+base_position = 10000
+lot_size = 100
+max_offset_lots = 20        # 最多减仓 2,000 股（约 20% 底仓）
+order_qty_lots = 8          # 每次信号 800 股，摊薄最低 5 元佣金
+warmup_bars = 8             # 开盘观察 8 分钟后才允许高抛
+zscore_window = 20          # 短窗口对 VWAP 偏离更敏感
+entry_z = 2.9               # 只在偏离 2.9 个标准差以上高抛
+take_profit_pct = 0.0065    # 较卖出均价回落 0.65% 回补（覆盖约 0.15% 往返成本）
+last_entry_time = "13:30"   # 13:30 后不再高抛
+eod_restore_time = "13:45"  # 13:45 后强制回补底仓：样本内午后趋势上行，
+                            # 提前收敛敞口显著降低了趋势日尾盘回补损失
+restore_at_close = true
+min_bar_amount = 0.0

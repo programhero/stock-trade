@@ -1,0 +1,56 @@
+# qtrade 配置文件
+# 复制本文件按需修改；命令行工具默认读取项目根目录的 config.toml。
+
+[symbol]
+code = "002352"          # 股票代码（akshare 使用 6 位代码）
+name = "顺丰控股"
+exchange = "SZ"
+
+[data]
+# synthetic: 合成演示数据（无需联网）
+# csv:       本地标准化 CSV
+# akshare:   通过 akshare 拉取最近几个交易日真实 1 分钟行情
+source = "synthetic"
+csv_path = "data/002352_1min.csv"
+synthetic_days = 5
+synthetic_seed = 20261106
+synthetic_start_price = 100.0
+lookback_days = 5        # akshare 回看交易日数
+poll_seconds = 15        # paper 模式轮询间隔（秒，>=5）
+
+[broker]
+initial_cash = 1000000.0
+# A 股 T+1：必须持有底仓才能日内卖出。initial_position 必须等于策略 base_position
+initial_position = 10000
+# 底仓成本价；0 表示使用首根 K 线开盘价（仅影响已实现盈亏展示，不影响权益）
+initial_avg_cost = 100.0
+slippage_bps = 1.0       # 单边滑点，1bp = 0.01%
+
+[broker.fees]
+commission_rate = 0.00025   # 佣金万 2.5
+min_commission = 5.0        # 单笔最低佣金
+stamp_duty_rate = 0.0005    # 印花税 0.05%，仅卖出
+transfer_fee_rate = 0.00001 # 过户费 0.001%，双向
+
+[risk]
+max_order_notional = 1000000.0  # 单笔最大金额；茅台等高价股请适当调大
+max_daily_trades = 60           # 每日最大委托笔数
+max_daily_loss = 3000.0         # 日内最大亏损（元），触发后当日停止交易
+max_position_deviation = 500    # 持仓相对底仓最大偏离（股）
+min_order_interval_bars = 1     # 两笔委托最少间隔 K 线数
+price_limit_pct = 0.10          # 涨跌停幅度（普通 A 股 10%）
+
+[strategy]
+name = "vwap_scalper"
+base_position = 10000        # 底仓股数（须与 broker.initial_position 一致）
+lot_size = 100
+max_offset_lots = 3         # 最多减仓 3 手（300 股）
+order_qty_lots = 1          # 每次信号 1 手
+warmup_bars = 10            # 开盘后观察 10 分钟再交易
+zscore_window = 30          # 偏离 z-score 滚动窗口
+entry_z = 1.2               # 高于 VWAP 1.2 个标准差触发高抛
+take_profit_pct = 0.003     # 较卖出均价回落 0.3% 回补
+last_entry_time = "14:30"   # 14:30 后不再高抛
+eod_restore_time = "14:45"  # 14:45 后回补底仓
+restore_at_close = true     # 尾盘是否强制回补底仓
+min_bar_amount = 0.0        # 单根 K 线最小成交额过滤，0 表示关闭
