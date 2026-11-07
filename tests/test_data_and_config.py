@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class ConfigTest(unittest.TestCase):
     def test_project_config_loads(self):
         cfg = load_config(ROOT / "config.toml")
-        self.assertEqual(cfg.symbol.code, "600519")
+        self.assertEqual(cfg.symbol.code, "002352")
         self.assertEqual(cfg.broker.fees.commission_rate, 0.00025)
         self.assertEqual(cfg.strategy.base_position, cfg.broker.initial_position)
 
