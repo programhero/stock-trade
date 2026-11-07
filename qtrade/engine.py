@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Iterable, Optional
+from typing import TYPE_CHECKING, Iterable, Optional
 
 from . import metrics as metrics_mod
 from .broker import DaySnapshot, PaperBroker
@@ -13,6 +13,9 @@ from .config import AppConfig
 from .risk import RiskManager
 from .strategy.base import Context, Strategy
 from .types import Bar, Fill, Order, OrderRequest
+
+if TYPE_CHECKING:
+    from .notify import TradeNotifier
 
 
 @dataclass(slots=True)
@@ -50,11 +53,13 @@ class Engine:
         broker: PaperBroker,
         risk: RiskManager,
         logger: logging.Logger | None = None,
+        notifier: "TradeNotifier | None" = None,
     ):
         self.cfg = cfg
         self.strategy = strategy
         self.broker = broker
         self.risk = risk
+        self.notifier = notifier
         self.log = logger or logging.getLogger("qtrade.engine")
         self._prev_close = 0.0
         self._in_day = False
@@ -99,6 +104,9 @@ class Engine:
                         initial_equity = self.broker.day_start_equity
 
                 fills = self.broker.process_bar(bar)
+                if self.notifier is not None:
+                    for fill in fills:
+                        self.notifier.notify_fill(fill, mode)
                 equity = self.broker.equity(bar.close)
 
                 newly_halted = self.risk.on_bar(bar, bar_index, equity)
@@ -179,6 +187,11 @@ class Engine:
             metrics["return_pct"],
         )
         return result
+
+    def close(self) -> None:
+        """等待异步推送队列清空（无推送器时为空操作）。"""
+        if self.notifier is not None:
+            self.notifier.close()
 
     # ------------------------------------------------------------------ 内部
 

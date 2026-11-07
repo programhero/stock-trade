@@ -22,6 +22,7 @@ from qtrade.config import AppConfig, ConfigError, load_config, validate_config
 from qtrade.data import CsvFeed, SyntheticFeed
 from qtrade.data.akshare_feed import AkshareMinuteFeed, fetch_minute_history, save_bars_csv
 from qtrade.engine import Engine, RunResult
+from qtrade.notify import TradeNotifier
 from qtrade.report import build_summary, save_report
 from qtrade.risk import RiskManager
 from qtrade.strategy import create_strategy
@@ -75,6 +76,11 @@ def load_optional_config(path: str) -> AppConfig:
 
 
 def build_engine(cfg: AppConfig) -> Engine:
+    notifier = TradeNotifier(
+        cfg.notify,
+        cfg.symbol.name,
+        logger=logging.getLogger("qtrade.notify"),
+    )
     broker = PaperBroker(
         symbol=cfg.symbol.code,
         cash=cfg.broker.initial_cash,
@@ -93,7 +99,14 @@ def build_engine(cfg: AppConfig) -> Engine:
         cfg.strategy.lot_size,
         logger=logging.getLogger("qtrade.risk"),
     )
-    return Engine(cfg, strategy, broker, risk, logger=logging.getLogger("qtrade.engine"))
+    return Engine(
+        cfg,
+        strategy,
+        broker,
+        risk,
+        logger=logging.getLogger("qtrade.engine"),
+        notifier=notifier,
+    )
 
 
 def build_backtest_feed(cfg: AppConfig) -> Iterable[Bar]:
@@ -114,7 +127,10 @@ def build_backtest_feed(cfg: AppConfig) -> Iterable[Bar]:
 
 
 def run_and_report(engine: Engine, feed, mode: str) -> RunResult:
-    result = engine.run(feed, mode=mode)
+    try:
+        result = engine.run(feed, mode=mode)
+    finally:
+        engine.close()  # 退出前尽量把已入队的成交推送发完
     print()
     print(build_summary(result))
     if result.equity_curve:

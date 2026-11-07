@@ -19,6 +19,7 @@
 - **三种数据源**：合成演示数据（零依赖）、标准化 CSV、akshare 真实 1 分钟行情。
 - **两种运行模式**：历史回测、盘中纸面交易（模拟账户，不连接真实券商）。
 - **完整报告**：控制台摘要 + `reports/` 下的成交、委托、权益曲线、每日统计 CSV。
+- **成交消息推送**：每笔成交可按模板渲染成 JSON，异步 POST 到自定义 webhook（见 10.1）。
 - **参数调优**：内置 `tune-stock` skill，按“剔除底仓市值波动后的交易净盈亏”做最多
   10 轮网格回测，为单只股票生成专用配置（见第 8 节）。
 - **可扩展**：策略、数据源、Broker 均有清晰接口；可接入 QMT/PTrade 等券商通道。
@@ -70,6 +71,7 @@ stockTrade/
 │   ├── risk.py                    # 交易前风控与日内熔断
 │   ├── engine.py                  # 事件驱动引擎（回测/纸面共用）
 │   ├── metrics.py                 # 绩效指标、日内做 T 配对分析
+│   ├── notify.py                  # 成交消息推送（模板渲染 + 后台 HTTP POST）
 │   ├── report.py                  # 摘要与报告文件输出
 │   ├── data/
 │   │   ├── synthetic.py           # 合成 1 分钟 K 线（离线演示）
@@ -82,7 +84,7 @@ stockTrade/
 │   ├── fetch_minute_data.py       # 下载真实 1 分钟行情到 CSV
 │   ├── tune_002352.py             # 002352 调优脚本（回放 / 网格）
 │   └── tune_601100.py             # 601100 调优脚本（回放 / 网格）
-├── tests/                         # 33 个单元/集成测试
+├── tests/                         # 45 个单元/集成测试
 ├── logs/                          # 运行日志（自动创建，已 gitignore）
 ├── reports/                       # 回测报告（自动创建，已 gitignore）
 └── data/                          # 行情 CSV（已 gitignore）
@@ -228,6 +230,7 @@ python -m pytest -q
 - `[broker.fees]`：佣金率、最低佣金、印花税率（仅卖出）、过户费率。
 - `[risk]`：单笔最大金额、每日委托笔数、日内最大亏损、持仓偏离、涨跌停幅度。
 - `[strategy]`：见上表。
+- `[notify]`：成交消息推送 URL、JSON 模板、超时与回测开关（见 10.1）。
 
 ### 7.2 易踩坑的配置
 
@@ -449,6 +452,57 @@ python main.py paper --config config.toml
 - `Ctrl+C` 会优雅退出、撤销未成交委托并输出当前报告。
 - 周末、收盘后启动会直接报错；交易日但行情源无数据时，10:00 后会提示可能休市或接口异常。
 
+### 10.1 交易消息推送（可选）
+
+开启 `[notify]` 后，每笔**成交**都会异步 POST 一份 JSON 到指定 URL，可接入钉钉、
+飞书、企业微信、Server酱等支持 webhook 的服务：
+
+```toml
+[notify]
+enabled = true
+url = "https://example.com/webhook"
+send_in_backtest = false       # 回测默认不推送，避免模拟成交被误认为实时交易
+timeout_seconds = 5.0
+template = '''
+{"text": "qtrade {{mode}} {{dt}} {{symbol_name}}({{symbol}}) {{side_label}} {{qty}} 股 @ {{price}} 元，金额 {{notional}} 元，手续费 {{fee}} 元，持仓 {{position_after}} 股，说明：{{reason}}"}
+'''
+```
+
+模板占位符（`{{...}}` 内的空格可有可无）：
+
+| 占位符 | 说明 |
+|---|---|
+| `symbol` / `symbol_name` | 股票代码 / 名称 |
+| `side` / `side_label` | `BUY` / `SELL`、`买入` / `卖出` |
+| `qty` | 成交股数 |
+| `price` | 成交价 |
+| `notional` | 成交金额（不含费用） |
+| `fee` | 总费用（佣金 + 印花税 + 过户费） |
+| `commission` / `stamp_duty` / `transfer_fee` | 各项费用 |
+| `position_after` | 成交后总持仓 |
+| `cash_after` | 成交后现金 |
+| `dt` / `date` / `time` | 成交时间 |
+| `order_id` | 委托编号 |
+| `reason` | 策略信号说明 |
+| `mode` | `paper`（回测为 `backtest`） |
+
+说明：
+
+- 字符串值会自动做 JSON 转义，因此 `reason` 中的引号、换行不会破坏请求体；
+  渲染后的结果必须仍是合法 JSON，加载配置时就会校验模板。
+- 嵌套 JSON 的服务（如钉钉/飞书）直接按它们的格式写模板即可，例如：
+
+  ```toml
+  template = '''
+  {"msgtype": "text", "text": {"content": "{{side_label}} {{symbol_name}} {{qty}} 股 @ {{price}} 元（{{dt}}）"}}
+  '''
+  ```
+
+- 推送在后台线程逐条发送，网络慢或失败不会阻塞撮合；失败只写 warning 日志，
+  不重试，也不影响交易和报告。
+- `paper` 模式默认推送；回测需要显式设置 `send_in_backtest = true`。
+- 进程正常退出（包括纸面交易 `Ctrl+C`）前会等待队列中的推送发完，最多等 10 秒。
+
 ---
 
 ## 11. 回测假设与限制
@@ -544,7 +598,7 @@ python -m unittest discover -s tests -t . -v
 python -m pytest -q
 ```
 
-当前 33 个测试，覆盖：
+当前 45 个测试，覆盖：
 
 - 撮合：滑点、佣金/印花税/过户费、限价单成交规则、收盘撤单；
 - T+1：当日买入不可卖、超出可用拒绝、次日可用恢复；
@@ -552,6 +606,8 @@ python -m pytest -q
 - 策略：VWAP/z-score、价格冲高触发高抛、价差达标回补、挂单时不重复下单；
 - 端到端：3 日回测不变量（持仓不越界、尾盘回到 1000 股底仓）、每日盈亏求和、
   报告文件生成、同种子结果确定性；
+- 消息推送：模板占位符与 JSON 转义、非法模板拒绝、本地 HTTP 服务接收 POST、
+  回测门控、引擎逐笔成交回调；
 - 数据与配置：合成数据可复现、中文 CSV 表头/去重/缺失成交额、未知配置字段拒绝。
 
 ---

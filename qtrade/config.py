@@ -15,6 +15,14 @@ class ConfigError(ValueError):
     """配置错误（字段名、取值或组合不合法）。"""
 
 
+# 默认成交推送模板：{{placeholder}} 会被替换为实际值，渲染后必须仍是合法 JSON。
+DEFAULT_NOTIFY_TEMPLATE = (
+    '{"text": "qtrade {{mode}} {{dt}} {{symbol_name}}({{symbol}}) '
+    '{{side_label}} {{qty}} 股 @ {{price}} 元，金额 {{notional}} 元，'
+    '手续费 {{fee}} 元，持仓 {{position_after}} 股，说明：{{reason}}"}'
+)
+
+
 @dataclass(slots=True)
 class SymbolConfig:
     code: str = "600519"
@@ -78,12 +86,22 @@ class StrategyConfig:
 
 
 @dataclass(slots=True)
+class NotifyConfig:
+    enabled: bool = False                    # 是否启用成交消息推送
+    url: str = ""                            # 消息推送地址（POST JSON）
+    template: str = DEFAULT_NOTIFY_TEMPLATE  # 请求体模板，支持 {{placeholder}}
+    timeout_seconds: float = 5.0             # 单次 HTTP 请求超时（秒）
+    send_in_backtest: bool = False           # 回测模式是否也推送（默认关闭）
+
+
+@dataclass(slots=True)
 class AppConfig:
     symbol: SymbolConfig = field(default_factory=SymbolConfig)
     data: DataConfig = field(default_factory=DataConfig)
     broker: BrokerConfig = field(default_factory=BrokerConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
+    notify: NotifyConfig = field(default_factory=NotifyConfig)
 
 
 _SECTION_TYPES = {
@@ -91,6 +109,7 @@ _SECTION_TYPES = {
     "data": (DataConfig, "data"),
     "risk": (RiskConfig, "risk"),
     "strategy": (StrategyConfig, "strategy"),
+    "notify": (NotifyConfig, "notify"),
 }
 
 
@@ -114,7 +133,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             raise ConfigError(f"配置文件不存在: {p}")
         with p.open("rb") as fh:
             raw = tomllib.load(fh)
-        allowed = {"symbol", "data", "broker", "risk", "strategy"}
+        allowed = {"symbol", "data", "broker", "risk", "strategy", "notify"}
         unknown_sections = set(raw) - allowed
         if unknown_sections:
             raise ConfigError(f"存在未知配置段: {', '.join(sorted(unknown_sections))}")
@@ -130,6 +149,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             broker=broker_cfg,
             risk=_build_section(RiskConfig, raw.get("risk"), "risk"),
             strategy=_build_section(StrategyConfig, raw.get("strategy"), "strategy"),
+            notify=_build_section(NotifyConfig, raw.get("notify"), "notify"),
         )
 
     validate_config(cfg)
@@ -217,3 +237,20 @@ def validate_config(cfg: AppConfig) -> None:
         raise ConfigError("risk.min_order_interval_bars 不能为负")
     if not (0 < r.price_limit_pct < 1):
         raise ConfigError("risk.price_limit_pct 必须在 (0, 1) 之间")
+
+    n = cfg.notify
+    if n.timeout_seconds <= 0:
+        raise ConfigError("notify.timeout_seconds 必须 > 0")
+    if n.enabled:
+        url = n.url.strip()
+        if not url:
+            raise ConfigError("notify.enabled 为 true 时必须配置 notify.url")
+        if not url.lower().startswith(("http://", "https://")):
+            raise ConfigError("notify.url 必须以 http:// 或 https:// 开头")
+    # 模板拼写错误在加载期就暴露，而不是等到第一笔成交。
+    from .notify import TemplateError, validate_template
+
+    try:
+        validate_template(n.template)
+    except TemplateError as exc:
+        raise ConfigError(str(exc)) from exc
