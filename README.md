@@ -19,6 +19,8 @@
 - **三种数据源**：合成演示数据（零依赖）、标准化 CSV、akshare 真实 1 分钟行情。
 - **两种运行模式**：历史回测、盘中纸面交易（模拟账户，不连接真实券商）。
 - **完整报告**：控制台摘要 + `reports/` 下的成交、委托、权益曲线、每日统计 CSV。
+- **参数调优**：内置 `tune-stock` skill，按“剔除底仓市值波动后的交易净盈亏”做最多
+  10 轮网格回测，为单只股票生成专用配置（见第 8 节）。
 - **可扩展**：策略、数据源、Broker 均有清晰接口；可接入 QMT/PTrade 等券商通道。
 
 核心代码只依赖 **Python 标准库**（Python ≥ 3.11，使用 `tomllib`）。
@@ -54,7 +56,12 @@ A 股当日买入的股票**不能当日卖出**。因此散户做日内交易�
 stockTrade/
 ├── main.py                        # CLI 入口：demo / backtest / paper / fetch
 ├── config.toml                    # 默认配置（可直接修改）
+├── config_002352.toml             # 002352 顺丰控股专用调优配置
+├── config_000100.toml             # 000100 TCL科技专用调优配置
+├── config_601100.toml             # 601100 恒立液压专用调优配置
 ├── requirements.txt               # 可选依赖（仅真实行情需要）
+├── .claude/
+│   └── skills/tune-stock/         # 参数调优 skill（SKILL.md + scripts/tune.py）
 ├── qtrade/
 │   ├── types.py                   # Bar / Order / Fill / Position 等数据结构
 │   ├── config.py                  # TOML 配置加载与一致性校验
@@ -72,8 +79,10 @@ stockTrade/
 │       ├── base.py                # Strategy / Context 接口
 │       └── vwap_scalper.py        # 默认策略：VWAP 均值回归做 T
 ├── scripts/
-│   └── fetch_minute_data.py       # 下载真实 1 分钟行情到 CSV
-├── tests/                         # 32 个单元/集成测试
+│   ├── fetch_minute_data.py       # 下载真实 1 分钟行情到 CSV
+│   ├── tune_002352.py             # 002352 调优脚本（回放 / 网格）
+│   └── tune_601100.py             # 601100 调优脚本（回放 / 网格）
+├── tests/                         # 33 个单元/集成测试
 ├── logs/                          # 运行日志（自动创建，已 gitignore）
 ├── reports/                       # 回测报告（自动创建，已 gitignore）
 └── data/                          # 行情 CSV（已 gitignore）
@@ -105,9 +114,14 @@ python main.py backtest --config config.toml --source akshare
 # 6) 交易时段内启动纸面交易（模拟账户）
 python main.py paper --config config.toml
 
-# 7) 运行测试
+# 7) 运行测试（零依赖）
 python -m unittest discover -s tests -t . -v
+# 或使用 pytest（需先 python -m pip install pytest）
+python -m pytest -q
 ```
+
+参数调优不是 `main.py` 的子命令：在 Claude Code 中打开项目后说“调优股票 601100”，
+或直接运行 `.claude/skills/tune-stock/scripts/tune.py`（见第 8 节）。
 
 每次运行会产生：
 
@@ -193,6 +207,8 @@ python -m unittest discover -s tests -t . -v
 以万 2.5 佣金、5 元最低佣金、0.05% 印花税、1bp 滑点估算，100 股 × 100 元的
 一个来回成本约 15 元（0.15%），因此 0.3% 的止盈阈值才略有利润。
 
+更系统的单股调优流程（`tune-stock` skill）见第 8 节。
+
 ---
 
 ## 7. 配置说明（config.toml）
@@ -232,15 +248,160 @@ python -m unittest discover -s tests -t . -v
 
 ---
 
-## 8. 数据说明
+## 8. 参数调优：用 tune-stock skill 生成专用配置
 
-### 8.1 合成数据（默认，无需联网）
+默认 `config.toml` 只是一份通用示例。不同股票的日振幅、趋势结构和最小变动价位
+差异很大，同一组参数很难通用。项目内置 Claude Code skill **`tune-stock`**，
+把一只股票最近几个交易日的 1 分钟数据变成一份经过多轮回测筛选的
+`config_<code>.toml`。
+
+核心原则：**只优化“做 T 交易本身的净盈亏”，不把底仓上涨当成策略收益。**
+
+### 8.1 前置条件
+
+1. 在项目根目录启动 Claude Code（`qtrade/`、`main.py` 所在目录）；
+2. 准备 `data/<code>_1min.csv`（至少 5 个交易日）。没有时先下载：
+
+```bash
+python -m pip install akshare pandas
+python scripts/fetch_minute_data.py 601100 --days 5
+```
+
+3. 建议先了解数据区间、每日振幅与隔夜跳空，它们决定调参方向：
+
+```bash
+PYTHONIOENCODING=utf-8 python - <<'EOF'
+import csv
+from collections import defaultdict
+code = "601100"
+rows = list(csv.DictReader(open(f"data/{code}_1min.csv", encoding="utf-8-sig")))
+days = defaultdict(list)
+for r in rows:
+    days[r["datetime"][:10]].append(r)
+for d, rs in sorted(days.items()):
+    o = float(rs[0]["open"]); c = float(rs[-1]["close"])
+    hi = max(float(x["high"]) for x in rs); lo = min(float(x["low"]) for x in rs)
+    print(d, len(rs), f"{o:.2f}->{c:.2f} {(c/o-1)*100:+.2f}% hi={hi:.2f} lo={lo:.2f}")
+EOF
+```
+
+### 8.2 触发调优
+
+在 Claude Code 会话中直接说：
+
+```
+调优股票 601100
+给 601100 生成专用配置
+帮我优化 qtrade 参数
+```
+
+也可以显式调用 `/tune-stock`。Skill 会自动：
+
+- 构造干净配置：底仓按约 33 万元市值折算、`initial_avg_cost = 0`、
+  滑点按“一档”换算、`max_position_deviation` 与 `max_offset_lots` 同步；
+- 以做 T 交易净盈亏为主目标，最多跑 10 轮网格回测；
+- 产出 `config_<code>.toml`、可选 `scripts/tune_<code>.py` 和正式回测报告；
+- 汇报时把交易口径与账户口径分开，并给出滑点压力结果与过拟合警告。
+
+### 8.3 评价口径与 10 轮流程
+
+调优脚本复用项目回测引擎，关键输出字段：
+
+| 字段 | 含义 | 用途 |
+|---|---|---|
+| `trade_pnl` | 卖出收入 − 买入支出 − 费用（剔除底仓市值波动） | **唯一主目标** |
+| `trade_pnl_per_day` | 按交易日拆分的交易盈亏 | 判断是否依赖单日 |
+| `trade_win_days` | 交易盈亏为正的天数 | 第一排序键 |
+| `trade_max_dd` | 剔除底仓后的盯市回撤 | 风险约束 |
+| `pairs` / `pair_win_rate` | 卖出→买回 FIFO 配对数量与胜率 | 策略质量 |
+| `account_pnl` | 含底仓市值的账户总盈亏 | **不要用于调参** |
+| `rejected` / `reject_reasons` | 拒单数量与原因 | 必须为 0 |
+
+排序规则：`trade_win_days` 优先（样本内最好每个交易日都盈利），其次
+`trade_pnl`；同时要求 `pairs ≥ 10`、`rejected = 0`、最大回撤可控。
+
+10 轮流程大致为：
+
+1. 粗扫信号：`entry_z` × `take_profit_pct` × `order_qty_lots`
+2. 指标窗口：`zscore_window` 与信号参数邻域
+3. 交易时段：`warmup_bars` × `last_entry_time` × `eod_restore_time`
+4. 仓位规模：`max_offset_lots` × `order_qty_lots`
+5. Regime 过滤：延长 `warmup_bars`，识别上午/下午效应
+6. 平台确认：统计最优邻域中有多少组做到每日盈利
+7. 细化仓位与时间参数
+8. 邻域稳健性：最优参数 ± 一档，最差组合也必须为正
+9. 边界扩展：最优落在网格边缘时继续外扩
+10. 压力测试与定稿：按滑点档位复测，选中心平台而非最高点
+
+### 8.4 直接运行调优脚本
+
+Skill 的核心脚本 `.claude/skills/tune-stock/scripts/tune.py` 也可以单独使用：
+
+```bash
+# 回放单组参数
+PYTHONIOENCODING=utf-8 python .claude/skills/tune-stock/scripts/tune.py --code 601100 \
+  --overrides '{"max_offset_lots":16,"order_qty_lots":2,"warmup_bars":115,
+                "zscore_window":35,"entry_z":2.6,"take_profit_pct":0.010,
+                "last_entry_time":"14:00","eod_restore_time":"14:45"}'
+
+# 网格搜索
+PYTHONIOENCODING=utf-8 python .claude/skills/tune-stock/scripts/tune.py --code 601100 \
+  --max-offset-lots 16 --order-qty-lots 2 \
+  --grid '{"zscore_window":[30,35],"warmup_bars":[110,115,120],
+           "entry_z":[2.0,2.2,2.4,2.6],"take_profit_pct":[0.010,0.011]}' --top 15
+```
+
+Windows Git Bash 用单引号包 JSON；cmd/PowerShell 建议写临时 Python 脚本调用
+`grid()` / `evaluate()`，避免引号转义问题。
+
+### 8.5 已生成的示例
+
+仓库中保留了三个标的的调优结果，可直接回测或作为模板：
+
+| 文件 | 标的 | 说明 |
+|---|---|---|
+| `config_002352.toml` | 002352 顺丰控股 | 第一只调优标的 |
+| `config_000100.toml` | 000100 TCL科技 | 低价股，按一档 22.4bp 滑点评估 |
+| `config_601100.toml` | 601100 恒立液压 | 高波动股，10 轮调优；上午不交易 |
+
+对应的回放脚本 `scripts/tune_002352.py`、`scripts/tune_601100.py` 可以重跑最终参数
+或局部网格：
+
+```bash
+python scripts/tune_601100.py          # 回放最终参数
+python scripts/tune_601100.py --grid   # 重跑第 10 轮邻域
+```
+
+用专用配置跑正式回测：
+
+```bash
+python main.py backtest --config config_601100.toml
+```
+
+### 8.6 注意事项
+
+1. **5 天样本很容易过拟合**：100% 配对胜率不是好消息，而是需要更长区间和
+   纸面交易继续验证的信号。
+2. **低价股必须按“档”测滑点**：股价 4.5 元时 1bp 只有 0.00045 元，
+   经最小变动价位取整后等于零滑点；真正的一档约 22bp。
+3. **`max_daily_loss` 不能太小**：该阈值按含底仓市值的账户权益计算，
+   隔夜跳空可能一开盘就打满熔断，并阻断尾盘回补。
+4. **同步风控偏离**：`risk.max_position_deviation` 必须不小于
+   `max_offset_lots × lot_size`，否则策略信号会被风控拒单。
+5. **调优结果是候选配置**：回测盈利不代表实盘盈利，请结合第 11 节的
+   回测假设与限制理解结果。
+
+---
+
+## 9. 数据说明
+
+### 9.1 合成数据（默认，无需联网）
 
 `SyntheticFeed` 用固定随机种子生成 5 个交易日、每日 240 根 1 分钟 K 线：
 低频正弦波段 + 高阶波动 + AR(1) 噪声 + U 型成交量。仅用于展示机制与测试，
 **不是真实行情，也不能据此判断策略盈利性**。
 
-### 8.2 CSV 格式
+### 9.2 CSV 格式
 
 标准列（表头可用中文别名）：
 
@@ -254,7 +415,7 @@ datetime,open,high,low,close,volume,amount
 - 加载时会排序、去重、剔除 OHLC 非法行；
 - 兼容表头：时间/日期、开盘、收盘、最高、最低、成交量、成交额。
 
-### 8.3 akshare 真实行情
+### 9.3 akshare 真实行情
 
 ```bash
 python -m pip install akshare pandas
@@ -270,7 +431,7 @@ python main.py backtest --config config.toml --source akshare
 
 ---
 
-## 9. 纸面交易（paper）
+## 10. 纸面交易（paper）
 
 ```bash
 # 交易时段（09:30–11:30, 13:00–15:00）运行
@@ -290,7 +451,7 @@ python main.py paper --config config.toml
 
 ---
 
-## 10. 回测假设与限制
+## 11. 回测假设与限制
 
 请务必理解以下简化，避免把回测结果等同于实盘：
 
@@ -321,7 +482,7 @@ python main.py paper --config config.toml
 
 ---
 
-## 11. 接入真实券商（未包含）
+## 12. 接入真实券商（未包含）
 
 当前项目**不包含**实盘下单实现。`PaperBroker` 的公开方法就是 Broker 适配层需要实现的接口：
 
@@ -346,7 +507,7 @@ position / cash
 
 ---
 
-## 12. 扩展自定义策略
+## 13. 扩展自定义策略
 
 实现 `qtrade.strategy.base.Strategy` 的两个方法，并注册到工厂：
 
@@ -373,13 +534,17 @@ STRATEGIES["my_strategy"] = MyStrategy
 
 ---
 
-## 13. 测试
+## 14. 测试
 
 ```bash
+# 零依赖（标准库 unittest）
 python -m unittest discover -s tests -t . -v
+
+# 或 pytest（需先 python -m pip install pytest）
+python -m pytest -q
 ```
 
-当前 32 个测试，覆盖：
+当前 33 个测试，覆盖：
 
 - 撮合：滑点、佣金/印花税/过户费、限价单成交规则、收盘撤单；
 - T+1：当日买入不可卖、超出可用拒绝、次日可用恢复；
@@ -391,7 +556,7 @@ python -m unittest discover -s tests -t . -v
 
 ---
 
-## 14. 常见问题
+## 15. 常见问题
 
 **Q：没有安装 akshare 能运行吗？**
 能。`demo`、`backtest --source synthetic`、`backtest --source csv` 和测试都不需要第三方包。
@@ -404,6 +569,10 @@ python -m unittest discover -s tests -t . -v
 **Q：为什么回补价差 0.3% 仍然可能亏钱？**
 佣金（尤其最低 5 元）、印花税 0.05% 和滑点会吞掉小价差。请按自己的费率估算
 单次往返成本，把 `take_profit_pct` 设在成本之上。
+
+**Q：如何为某只股票生成专用配置？**
+使用内置 `tune-stock` skill：在 Claude Code 中说“调优股票 601100”或调用 `/tune-stock`，
+详见第 8 节。需先准备 `data/<代码>_1min.csv`。
 
 **Q：能否同时交易多只股票？**
 当前引擎是单标的；多标的可以起多个引擎实例（各自账户与风控），但共享资金需要额外的组合层。
@@ -418,7 +587,7 @@ python -m unittest discover -s tests -t . -v
 
 ---
 
-## 15. 风险提示
+## 16. 风险提示
 
 - 日内高频交易对成本、滑点、延迟和纪律极其敏感，回测盈利不代表实盘盈利。
 - 合成数据与历史数据均存在偏差；请使用真实行情、贴近实际的手续费与滑点做压力测试。
